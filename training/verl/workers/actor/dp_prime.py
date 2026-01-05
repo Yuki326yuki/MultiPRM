@@ -34,6 +34,10 @@ PRIME_LOSS = {
     'ce': core_algos.compute_ce_dpo_loss_rm
 }
 
+def _pairwise_bce_loss(delta_scores: torch.Tensor) -> torch.Tensor:
+    """-log sigmoid(delta). delta can be any real-valued tensor."""
+    return torch.nn.functional.softplus(-delta_scores).mean()
+
 class DataParallelPRIME(BasePPOActor):
 
     def __init__(
@@ -43,6 +47,7 @@ class DataParallelPRIME(BasePPOActor):
         reference_module: nn.Module,
         reward_optimizer: torch.optim.Optimizer = None,
         prime_loss_fn='ce',
+        tokenizer=None,
     ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
@@ -50,14 +55,43 @@ class DataParallelPRIME(BasePPOActor):
         self.reference_module = reference_module
         self.reward_optimizer = reward_optimizer
         self.prime_loss_fn = PRIME_LOSS[prime_loss_fn]
+        self.tokenizer = tokenizer
+
+        # Optional offline PRM training module (disabled by default)
+        self.offline_cfg = (self.config.prime_model.get('offline_data', None) or {})
+        self.offline_enabled = bool(self.offline_cfg.get('enabled', False))
+        self._offline_sampler = None
+        if self.offline_enabled:
+            if self.tokenizer is None:
+                raise ValueError("offline_data.enabled=True requires passing a tokenizer to DataParallelPRIME")
+            from verl.utils.offline_prm import OfflinePRMSampler
+            self._offline_sampler = OfflinePRMSampler(cfg=self.offline_cfg, tokenizer=self.tokenizer)
+            print(f"[PRIME] Offline PRM module enabled. sources={self._offline_sampler.summary()}")
         self.use_remove_padding = self.config.prime_model.get('use_remove_padding', False)
         print(f'PRM use_remove_padding={self.use_remove_padding}')
+
+        # Online PRM multi-signal losses (CLS/REG/PREF). Defaults preserve original behavior (CLS-only).
+        self.online_loss_cfg = (self.config.prime_model.get('online_losses', None) or {})
+        self.online_enable_reg = bool(self.online_loss_cfg.get('enable_reg', False))
+        self.online_enable_pref = bool(self.online_loss_cfg.get('enable_pref', False))
+        self.w_online_cls = float(self.online_loss_cfg.get('loss_weight_cls', 1.0))
+        self.w_online_reg = float(self.online_loss_cfg.get('loss_weight_reg', 1.0))
+        self.w_online_pref = float(self.online_loss_cfg.get('loss_weight_pref', 0.5))
+        self.online_reg_key = str(self.online_loss_cfg.get('reg_key', 'reg'))
+        # If True, PREF pairs are built using (correct vs incorrect) when possible; otherwise fall back to reg-score ranking.
+        self.pref_use_outcome_when_available = bool(self.online_loss_cfg.get('pref_use_outcome_when_available', True))
 
     def _make_minibatch_iterator(self, data: DataProto) -> Iterable[DataProto]:
         """Make minibatch iterator for updating the actor
         See PPO paper for details. https://arxiv.org/abs/1707.06347
         """
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'acc', 'old_log_probs']
+        # Optional online signals for PRM training
+        if hasattr(data, 'batch'):
+            if 'reg' in data.batch:
+                select_keys.append('reg')
+            if 'score' in data.batch:
+                select_keys.append('score')
         data = data.select(batch_keys=select_keys)
         return data.make_iterator(mini_batch_size=self.config.mini_batch_size,
                                   epochs=1)
@@ -142,6 +176,115 @@ class DataParallelPRIME(BasePPOActor):
 
         return token_level_score, q
 
+    def _offline_prm_update(self, metrics: dict):
+        """Optional offline PRM update.
+
+        This is intentionally *decoupled* from PRIME's online rollout flow:
+        - It only updates the PRM (self.reward_module)
+        - It does NOT affect the returned token_level_scores for policy advantage
+        - It is fully optional via config.prime_model.offline_data.enabled
+        """
+        if (not self.offline_enabled) or (self._offline_sampler is None):
+            return
+
+        cfg = self.offline_cfg
+        steps = int(cfg.get('steps_per_iter', 1))
+        batch_size = int(cfg.get('batch_size', self.config.micro_batch_size))
+        micro_bs = int(cfg.get('micro_batch_size', self.config.micro_batch_size))
+        assert batch_size % micro_bs == 0, "offline_data.batch_size must be divisible by offline_data.micro_batch_size"
+        grad_accum = batch_size // micro_bs
+        beta = float(cfg.get('beta_train', self.config.prime_model.get('beta_train', 0.05)))
+        w_pref = float(cfg.get('loss_weight_pref', 0.5))
+        w_cls = float(cfg.get('loss_weight_cls', 1.0))
+        w_reg = float(cfg.get('loss_weight_reg', 1.0))
+
+        # Mix proportions inside an offline batch
+        p_pref = float(cfg.get('mix_pref', 0.2))
+        p_cls = float(cfg.get('mix_cls', 0.5))
+        p_reg = float(cfg.get('mix_reg', 0.3))
+        # Normalize in case user doesn't sum to 1
+        denom = max(p_pref + p_cls + p_reg, 1e-8)
+        p_pref, p_cls, p_reg = p_pref/denom, p_cls/denom, p_reg/denom
+
+        for _ in range(steps):
+            # Build one mixed offline batch
+            n_pref = int(round(batch_size * p_pref))
+            n_cls = int(round(batch_size * p_cls))
+            n_reg = max(batch_size - n_pref - n_cls, 0)
+
+            pref_samples = self._offline_sampler.sample_pref(n_pref) if n_pref > 0 else []
+            cls_samples = self._offline_sampler.sample_cls(n_cls) if n_cls > 0 else []
+            reg_samples = self._offline_sampler.sample_reg(n_reg) if n_reg > 0 else []
+
+            # Tokenize & compute losses
+            self.reward_optimizer.zero_grad()
+            total_loss = 0.0
+
+            # (1) CLS/REG: reuse PRIME CE loss (BCE on sigmoid(sum(q)*beta))
+            def _run_pointwise(samples, label_key: str, weight: float, tag: str):
+                nonlocal total_loss
+                if not samples:
+                    return
+                batch = self._offline_sampler.collate_pointwise(samples)
+                bs = batch['input_ids'].shape[0]
+                for start in range(0, bs, micro_bs):
+                    mb = {k: (v[start:start+micro_bs].cuda() if torch.is_tensor(v) else v) for k, v in batch.items()}
+                    prompt_len = int(mb['prompt_length'].max().item())
+                    log_prob = self._forward_micro_batch(module=self.reward_module, micro_batch=mb, prompt_length=prompt_len)
+                    if self.reference_module is not None:
+                        ref_log_prob = self._forward_micro_batch(module=self.reference_module, micro_batch=mb, prompt_length=prompt_len, no_grad=True)
+                    else:
+                        # If no reference module, fall back to using current log_prob as ref (zero reward). Not recommended.
+                        ref_log_prob = log_prob.detach()
+
+                    response_length = mb['responses'].shape[-1]
+                    q = log_prob[:, -response_length:] - ref_log_prob[:, -response_length:]
+                    eos_mask = mb['eos_mask']
+                    labels = mb[label_key].to(torch.float32)
+                    loss = (weight * core_algos.compute_ce_dpo_loss_rm(q, labels, eos_mask=eos_mask, beta=beta)) / grad_accum
+                    loss.backward()
+                    total_loss = total_loss + loss.detach().item()
+
+            _run_pointwise(cls_samples, 'label', w_cls, 'cls')
+            _run_pointwise(reg_samples, 'score', w_reg, 'reg')
+
+            # (2) PREF: pairwise logistic on sequence-level rewards
+            if pref_samples:
+                batch_pos, batch_neg = self._offline_sampler.collate_pairwise(pref_samples)
+                # micro-batch over pairs
+                for start in range(0, batch_pos['input_ids'].shape[0], micro_bs):
+                    mb_pos = {k: v[start:start+micro_bs].cuda() for k, v in batch_pos.items()}
+                    mb_neg = {k: v[start:start+micro_bs].cuda() for k, v in batch_neg.items()}
+
+                    def _seq_reward(mb):
+                        prompt_len = int(mb['prompt_length'].max().item())
+                        log_prob = self._forward_micro_batch(module=self.reward_module, micro_batch=mb, prompt_length=prompt_len)
+                        if self.reference_module is not None:
+                            ref_log_prob = self._forward_micro_batch(module=self.reference_module, micro_batch=mb, prompt_length=prompt_len, no_grad=True)
+                        else:
+                            ref_log_prob = log_prob.detach()
+                        response_length = mb['responses'].shape[-1]
+                        q = log_prob[:, -response_length:] - ref_log_prob[:, -response_length:]
+                        # length-normalized sequence score
+                        seq = (q * mb['eos_mask']).sum(dim=1) / (mb['eos_mask'].sum(dim=1).clamp_min(1.0))
+                        return seq
+
+                    s_pos = _seq_reward(mb_pos)
+                    s_neg = _seq_reward(mb_neg)
+                    delta = beta * (s_pos - s_neg)
+                    loss = (w_pref * _pairwise_bce_loss(delta)) / grad_accum
+                    loss.backward()
+                    total_loss = total_loss + loss.detach().item()
+
+            grad_norm = self._optimizer_step()
+            append_to_dict(metrics, {
+                'reward_model/offline_enabled': 1.0,
+                'reward_model/offline_total_loss': float(total_loss),
+                'reward_model/offline_grad_norm': grad_norm.detach().item(),
+            })
+
+
+
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.reward_module.train()
@@ -180,21 +323,80 @@ class DataParallelPRIME(BasePPOActor):
 
                 token_level_score, q = self.compute_implicit_reward(data, log_prob, ref_log_prob)
                 token_level_scores.append(token_level_score)
-                prime_loss = self.prime_loss_fn(q, batch_acc, eos_mask=batch_eos_mask, beta=beta)
-                loss = prime_loss / self.gradient_accumulation
+
+                # ----- Online PRM multi-signal update (CLS/REG/PREF) -----
+                # CLS (outcome correctness) is always available (batch_acc).
+                loss_cls = self.prime_loss_fn(q, batch_acc, eos_mask=batch_eos_mask, beta=beta)
+
+                # Optional REG: continuous score in [0,1] if present (e.g., step-score).
+                loss_reg = None
+                if self.online_enable_reg:
+                    if self.online_reg_key in data:
+                        reg_labels = data[self.online_reg_key].to(batch_acc.dtype)
+                        loss_reg = self.prime_loss_fn(q, reg_labels, eos_mask=batch_eos_mask, beta=beta)
+                    elif 'score' in data:
+                        reg_labels = data['score'].to(batch_acc.dtype)
+                        loss_reg = self.prime_loss_fn(q, reg_labels, eos_mask=batch_eos_mask, beta=beta)
+
+                # Optional PREF: build preference pairs within each prompt-group of size n_samples.
+                loss_pref = None
+                if self.online_enable_pref and (n_samples is not None) and int(n_samples) > 1:
+                    ns = int(n_samples)
+                    if (data['responses'].shape[0] % ns) != 0:
+                        raise ValueError(
+                            f"online PREF requires micro_batch_size to be a multiple of n_samples. "
+                            f"Got micro_bs={data['responses'].shape[0]} n_samples={ns}"
+                        )
+                    # Sequence-level length-normalized implicit reward (before beta scaling).
+                    seq_score = (q.to(torch.float32) * batch_eos_mask.to(torch.float32)).sum(dim=1) / (
+                        batch_eos_mask.to(torch.float32).sum(dim=1).clamp_min(1.0)
+                    )
+                    # Optional reg values (for fallback pairing)
+                    reg_vals = None
+                    if self.online_enable_reg:
+                        if self.online_reg_key in data:
+                            reg_vals = data[self.online_reg_key].to(torch.float32)
+                        elif 'score' in data:
+                            reg_vals = data['score'].to(torch.float32)
+                    deltas = []
+                    for g in range(0, seq_score.shape[0], ns):
+                        acc_g = batch_acc[g:g+ns]
+                        score_g = seq_score[g:g+ns]
+                        pos_j = neg_j = None
+                        if self.pref_use_outcome_when_available and (acc_g.max() > 0) and (acc_g.min() < 1):
+                            pos_candidates = (acc_g > 0).nonzero(as_tuple=True)[0]
+                            neg_candidates = (acc_g <= 0).nonzero(as_tuple=True)[0]
+                            pos_j = pos_candidates[score_g[pos_candidates].argmax()]
+                            neg_j = neg_candidates[score_g[neg_candidates].argmax()]
+                        elif reg_vals is not None:
+                            reg_g = reg_vals[g:g+ns]
+                            if (reg_g.max() - reg_g.min()) > 1e-6:
+                                pos_j = reg_g.argmax()
+                                neg_j = reg_g.argmin()
+                        if (pos_j is not None) and (neg_j is not None) and (pos_j != neg_j):
+                            deltas.append(score_g[pos_j] - score_g[neg_j])
+                    if deltas:
+                        delta = torch.stack(deltas, dim=0)
+                        loss_pref = _pairwise_bce_loss(beta * delta)
+
+                # Combine losses (defaults keep CLS-only behavior).
+                total_loss = self.w_online_cls * loss_cls
+                if loss_reg is not None:
+                    total_loss = total_loss + (self.w_online_reg * loss_reg)
+                if loss_pref is not None:
+                    total_loss = total_loss + (self.w_online_pref * loss_pref)
+
+                prime_loss = total_loss
+                loss = total_loss / self.gradient_accumulation
                 loss.backward()
-                
-                # logits = torch.cat([result_tuple[0] for result_tuple in result_tuples], dim=0)
-                # token_level_score = torch.cat([output_tuple[0] for output_tuple in output_tuples])
-                # token_level_scores.append(token_level_score)
-                # original_token_level_score = torch.cat([output_tuple[1] for output_tuple in output_tuples])
-            
+
             grad_norm = self._optimizer_step()
             data = {
                 'reward_model/prm_loss':prime_loss.detach().item(),
                 'reward_model/grad_norm': grad_norm.detach().item(),
                 }
             append_to_dict(metrics, data)
+
         self.reward_optimizer.zero_grad()
         torch.cuda.empty_cache()
         
@@ -206,6 +408,9 @@ class DataParallelPRIME(BasePPOActor):
             'reward_model/dpo_acc_before': dpo_acc_before.detach().item(),
         }
         append_to_dict(metrics, data)
+
+        # Optional offline PRM update (doesn't affect returned token_level_scores)
+        self._offline_prm_update(metrics)
 
         if self.config.prime_model.update == "before":
             token_level_scores = []
