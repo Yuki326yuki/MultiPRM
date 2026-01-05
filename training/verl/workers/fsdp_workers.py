@@ -144,6 +144,18 @@ class ActorRolloutRefWorker(Worker):
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
 
+            # Optional LoRA (PEFT-free). Applied to actor only (not reference).
+            # NOTE: we inject LoRA *before* FSDP wrapping.
+            if not self._is_ref:
+                try:
+                    from verl.utils.lora import apply_lora
+                    model_cfg = getattr(self.config, 'model', None)
+                    lora_cfg = None if model_cfg is None else model_cfg.get('lora', None)
+                    actor_module = apply_lora(actor_module, lora_cfg, verbose=(self.rank == 0))
+                except Exception as e:
+                    if self.rank == 0:
+                        print(f"[LoRA] Skipped/failed to apply LoRA for actor: {e}")
+
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable()
         torch.distributed.barrier()
@@ -200,7 +212,8 @@ class ActorRolloutRefWorker(Worker):
         # TODO: add more optimizer args into config
         if self._is_actor:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup
-            actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
+            trainable_params = [p for p in actor_module_fsdp.parameters() if p.requires_grad]
+            actor_optimizer = optim.AdamW(trainable_params,
                                           lr=optim_config.lr,
                                           betas=optim_config.get('betas', (0.9, 0.999)),
                                           weight_decay=optim_config.get('weight_decay', 1e-2))
@@ -876,6 +889,14 @@ class PRIMERewardModelWorker(Worker):
                                                                                attn_implementation='flash_attention_2',
                                                                                trust_remote_code=trust_remote_code)
             reward_module.to(torch.float32)
+            # Optional LoRA for PRM (PEFT-free). Applied to reward_module only.
+            # NOTE: inject LoRA before FSDP wrapping.
+            try:
+                from verl.utils.lora import apply_lora
+                reward_module = apply_lora(reward_module, config.prime_model.get('lora', None), verbose=(self.rank == 0))
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"[LoRA] Skipped/failed to apply LoRA for PRM: {e}")
             if enable_gradient_checkpointing:
                 reward_module.gradient_checkpointing_enable()
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision
@@ -925,7 +946,8 @@ class PRIMERewardModelWorker(Worker):
         if self.update_dpo_type in ['before', 'after']:
 
             from torch import optim
-            self.reward_optimizer = optim.AdamW(reward_module.parameters(),
+            trainable_params = [p for p in reward_module.parameters() if p.requires_grad]
+            self.reward_optimizer = optim.AdamW(trainable_params,
                                                 lr=config.prime_model.optim.lr,
                                                 betas=config.prime_model.optim.get('betas', (0.9, 0.999)),
                                                 weight_decay=config.prime_model.optim.get('weight_decay', 1e-2))
@@ -961,7 +983,8 @@ class PRIMERewardModelWorker(Worker):
                                     reward_module=self.reward_module,
                                     reference_module=self.reference_module,
                                     reward_optimizer=self.reward_optimizer,
-                                    prime_loss_fn=self.config.prime_model.get('loss_type', 'ce'))
+                                    prime_loss_fn=self.config.prime_model.get('loss_type', 'ce'),
+                                    tokenizer=getattr(self, 'tokenizer', None))
         torch.cuda.empty_cache()
 
     def _switch_chat_template(self, data: DataProto):
