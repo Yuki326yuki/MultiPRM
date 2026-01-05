@@ -20,11 +20,19 @@ data:
 actor_rollout_ref:
   hybrid_engine: True
   model:
+    # Example: Qwen2.5-7B (set via CLI/override as needed)
     path: ~/models/deepseek-llm-7b-chat
     external_lib: null
     override_config: {}
     use_remove_padding: False
     enable_gradient_checkpointing: False
+    # Optional LoRA for the policy actor (PEFT-free)
+    lora:
+      enabled: False
+      r: 8
+      alpha: 16
+      dropout: 0.05
+      target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
   actor:
     strategy: fsdp  # This is for backward-compatibility
     ppo_mini_batch_size: 256
@@ -155,6 +163,50 @@ reward_model:
       grad_clip: 1.0
     beta_train: 0.05
     loss_type: ce # currently only supports ce loss
+
+    # Optional LoRA for the implicit PRM (reward_module). PEFT-free.
+    lora:
+      enabled: False
+      r: 8
+      alpha: 16
+      dropout: 0.05
+      target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+    # Online PRM multi-signal losses (applied during the standard PRIME online PRM update).
+    # Defaults keep original PRIME behavior (CLS-only) unless enabled explicitly.
+    online_losses:
+      enable_reg: False        # if True, expects a per-sample continuous label in batch key `reg` (or `score`) in [0,1]
+      enable_pref: False       # if True, builds preference pairs within each prompt-group (size = n_samples)
+      reg_key: reg             # name of the continuous label key in the on-policy batch (fallback to `score` if missing)
+      pref_use_outcome_when_available: True
+      loss_weight_cls: 1.0
+      loss_weight_reg: 1.0
+      loss_weight_pref: 0.5
+
+    # Optional offline PRM module (disabled by default)
+    # Provide any subset of {pref_path, cls_path, reg_path} as JSONL files.
+    # See training/verl/utils/offline_prm.py for the expected JSONL schemas.
+    offline_data:
+      enabled: False
+      pref_path: null
+      cls_path: null
+      reg_path: null
+      # Offline PRM update schedule per PRIME iteration
+      steps_per_iter: 1
+      batch_size: 256
+      micro_batch_size: 64
+      # Loss weights inside the offline PRM update
+      loss_weight_pref: 0.5
+      loss_weight_cls: 1.0
+      loss_weight_reg: 1.0
+      # Mix ratios inside one offline batch (will be renormalized)
+      mix_pref: 0.2
+      mix_cls: 0.5
+      mix_reg: 0.3
+      # Tokenization limits (prompt/response are tokenized separately)
+      max_prompt_len: 512
+      max_response_len: 1024
+      max_total_len: 1536
 
 
 
